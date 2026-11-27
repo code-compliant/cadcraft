@@ -16,7 +16,6 @@ pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
     }
     let Ok(d) = app.session.doc() else { return right };
     let current = d.current_anno_scale().name;
-    let names: Vec<String> = d.scales.iter().map(|s| s.name.clone()).collect();
     let t = Tokens::get();
     let p = ui.painter().clone();
     let g = p.layout_no_wrap(current.clone(), crate::theme::small(), t.text);
@@ -29,6 +28,11 @@ pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
     p.line_segment([pos2(ax - 3.0, ay - 1.5), pos2(ax, ay + 1.5)], egui::Stroke::new(1.2, t.text_dim));
     p.line_segment([pos2(ax, ay + 1.5), pos2(ax + 3.0, ay - 1.5)], egui::Stroke::new(1.2, t.text_dim));
     crate::icons::describe_control(ui, &resp, "Annotation scale", None, false);
+    // A popup that was already open can receive input even when its button is disabled.
+    if !ui.is_enabled() {
+        return r.left() - 6.0;
+    }
+    let names: Vec<String> = d.scales.iter().map(|s| s.name.clone()).collect();
     let resp = resp.on_hover_text(crate::tl!("Annotation scale"));
     let mut pick: Option<String> = None;
     let mut edit = false;

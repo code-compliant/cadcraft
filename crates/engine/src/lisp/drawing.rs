@@ -74,6 +74,10 @@ fn items(p: &PickSet) -> Vec<Handle> {
 /// ([`crate::Origin::Program`]): the command it starts here, and the one a `'command` token
 /// starts while another command runs, never open a dialog.
 pub fn command(ctx: &mut Ctx<'_>, a: Vec<Value>) -> Result<Flow, LispError> {
+    // `action_tile` evaluates its expression as a callback. The public reference excludes `command`.
+    if ctx.env.dialog.in_action() {
+        return Err(LispError::new("command cannot be called from a dialog action"));
+    }
     if a.is_empty() {
         if ctx.s.running.is_some() {
             ctx.s.cancel();

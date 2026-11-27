@@ -939,6 +939,10 @@ fn text_command(id: &str, mac: bool) -> Option<TextCommand> {
 /// Run `id` with default parameters without cancelling the active command, as the drafting
 /// toggles (F3, F7-F12, the status bar buttons) are in AutoCAD.
 pub fn run_transparent(app: &mut CadApp, id: &str) {
+    // Drafting toggles reach `execute` directly. A modal dialog already owns that input.
+    if app.session.dialog_active() && !id.starts_with("ui.") {
+        return;
+    }
     match app.session.execute(id, &json!({})) {
         Ok(v) => {
             if let Some(m) = v.get("message").and_then(Value::as_str) {
@@ -1031,9 +1035,9 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
             }
             crate::clipboard::ShortcutAction::PasteTable(tsv) => {
                 pasted_table = true;
-                app.cmd.buffer.clear();
-                if let Err(e) = app.session.start_paste_table(&tsv, None) {
-                    app.session.echo(e.to_string());
+                match app.session.start_paste_table(&tsv, None) {
+                    Ok(()) => app.cmd.buffer.clear(),
+                    Err(e) => app.session.echo(e.to_string()),
                 }
             }
         }
@@ -1056,6 +1060,9 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
         }
         // ISOPLANE (F5, Ctrl+E) switches the plane without cancelling the active command.
         if id == "isoplane" {
+            if app.session.dialog_active() {
+                continue;
+            }
             if let Some(m) = app.session.execute(id, &json!({})).ok().and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string)) {
                 app.session.echo(m);
             }
@@ -1256,6 +1263,72 @@ mod reference_order_tests {
         let app = CadApp::new(Session::new(), Services::default());
         let edit = tree(&app).into_iter().find(|(m, _)| m == "Edit").map(|(_, e)| e).unwrap_or_default();
         assert_eq!(edit.iter().take(2).map(label).collect::<Vec<_>>(), ["Undo", "Redo"]);
+    }
+
+    /// Quick Properties and drafting keys do not change the drawing while a dialog owns input.
+    #[test]
+    fn dialog_blocks_quick_properties_and_drafting_shortcuts() {
+        use egui::{Event, Key, Modifiers, Pos2, Rect, Vec2 as EVec2};
+
+        let mut app = CadApp::new(Session::new(), Services::default());
+        app.session.execute("line", &serde_json::json!({ "points": [[0.0, 0.0], [10.0, 0.0]] })).unwrap();
+        let (handle, layer) = {
+            let doc = app.session.doc().unwrap();
+            let entity = doc.model.iter().next().unwrap();
+            (entity.handle, entity.common.layer.clone())
+        };
+        app.session.set_selection(vec![handle]);
+        app.session.execute("qpmode", &serde_json::json!({ "on": true })).unwrap();
+        app.session.settings.isoplane = cadcraft_engine::snap::iso::IsoPlane::Left;
+        let ortho = app.session.settings.orthomode;
+        let plane = app.session.settings.isoplane;
+
+        let dir = std::env::temp_dir().join(format!("cadcraft-dcl-shortcuts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe.dcl");
+        std::fs::write(&path, "probe : dialog {\n  label = \"Probe\";\n}\n").unwrap();
+        let quoted = path.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
+        app.cmdline(&format!("(progn (setq id (load_dialog \"{quoted}\")) (new_dialog \"probe\" id) (start_dialog))"));
+        assert!(app.session.dialog_active());
+
+        let ctx = egui::Context::default();
+        let press = |key: Key| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, EVec2::new(900.0, 600.0))),
+            events: vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(press(Key::F5), |ui| super::shortcuts(&mut app, ui.ctx()));
+        out.textures_delta.clear();
+        let mut out = ctx.run_ui(press(Key::F8), |ui| super::shortcuts(&mut app, ui.ctx()));
+        out.textures_delta.clear();
+        assert_eq!(app.session.settings.isoplane, plane, "F5 stays blocked while the dialog owns input");
+        assert_eq!(app.session.settings.orthomode, ortho, "F8 stays blocked while the dialog owns input");
+        assert_eq!(app.session.doc().unwrap().entity(handle).unwrap().common.layer, layer);
+
+        let sel = vec![handle];
+        let qp_id = egui::Id::unique(("quick_properties", &sel));
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, EVec2::new(900.0, 600.0))), ..Default::default() };
+        let mut showed = false;
+        let mut out = egui::Context::default().run_ui(raw.clone(), |ui| {
+            crate::quick::quick_properties(&mut app, ui.ctx());
+            showed = ui.ctx().memory(|memory| memory.area_rect(qp_id).is_some());
+        });
+        out.textures_delta.clear();
+        assert!(!showed, "Quick Properties stays closed while the dialog owns input");
+        assert_eq!(app.session.doc().unwrap().entity(handle).unwrap().common.layer, layer);
+        assert_eq!(app.session.selection(), sel);
+
+        super::run_transparent(&mut app, "ui.panel.properties");
+        assert!(app.ui.docking.layout().contains(&crate::docking::Panel::Properties), "the properties inspector still opens");
+        assert!(app.session.dialog_active());
+
+        let drawings = app.session.summary()["documents"].as_array().map(Vec::len).unwrap_or(0);
+        app.start("new");
+        assert!(!app.session.dialog_active(), "New still cancels the waiting dialog");
+        let after = app.session.summary()["documents"].as_array().map(Vec::len).unwrap_or(0);
+        assert!(after > drawings);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

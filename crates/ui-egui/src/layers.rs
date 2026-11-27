@@ -220,6 +220,7 @@ pub(crate) fn natural_lower(s: &str) -> String {
 /// The Layer Properties Manager window.
 pub fn dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
     let t = Tokens::get();
+    let modal = app.session.dialog_active();
     let sid = egui::Id::unique("lpm_state");
     let mut st: LpmState = ctx.data_mut(|d| d.get_temp(sid)).unwrap_or_default();
     let mut actions: Vec<(&str, Value)> = Vec::new();
@@ -257,6 +258,9 @@ pub fn dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
         .min_width(640.0)
         .resizable(true)
         .show(ctx, |ui| {
+            if modal {
+                ui.disable();
+            }
             // ----- tool row -----
             ui.horizontal(|ui| {
                 if icons::button(ui, Icon::Plus, 24.0, "New Layer", false).clicked() {
@@ -414,6 +418,10 @@ pub fn dialog(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) {
             });
         });
     ctx.data_mut(|dd| dd.insert_temp(sid, st));
+    // The manager stays visible while the DCL dialog owns drawing input.
+    if modal {
+        return;
+    }
     for (c, p) in actions {
         let _ = app.run(c, p);
     }

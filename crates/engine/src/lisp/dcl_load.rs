@@ -39,14 +39,12 @@ pub struct LoadedFile {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub path: PathBuf,
     /// Parsed tiles and include records, in source order.
-    #[allow(dead_code)] // retained for the dialog commands that follow this load
     pub parsed: Dcl,
 }
 
 /// The files retained for one positive `load_dialog` handle.
 pub struct LoadedDialog {
     /// Root file first, then each included file. Dialog commands read these tiles.
-    #[allow(dead_code)] // retained for the dialog commands that follow this load
     pub files: Vec<LoadedFile>,
 }
 
@@ -153,7 +151,7 @@ fn resolve_include(spec: &str, including: &Path, cwd: &Path) -> Option<PathBuf> 
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn is_readable_file(path: &Path) -> bool {
+pub(super) fn is_readable_file(path: &Path) -> bool {
     crate::file_access::check_read(path).is_ok() && path.is_file()
 }
 

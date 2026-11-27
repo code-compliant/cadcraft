@@ -283,10 +283,19 @@ struct Navigation<'a> {
     pointer: PointerInput,
 }
 
-fn navigate_canvas(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>) -> Option<(bool, bool)> {
+fn navigate_canvas(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>, accepts_point: bool) -> Option<(bool, bool)> {
     let p = nav.pointer;
-    let inside = p.hover_pos.is_some_and(|at| nav.rect.contains(at) && ui.ctx().layer_id_at(at) == Some(ui.layer_id()) && nav.response.hovered());
+    let inside = accepts_point
+        && p.hover_pos.is_some_and(|at| nav.rect.contains(at) && ui.ctx().layer_id_at(at) == Some(ui.layer_id()) && nav.response.hovered());
     let on_menu = p.hover_pos.is_some_and(|at| over_canvas_menu(app, at));
+    if app.session.dialog_active() {
+        // A callback can accept a point without giving up the dialog's control of navigation.
+        app.canvas.pan_last = None;
+        if !accepts_point {
+            app.canvas.press = None;
+        }
+        return Some((inside, on_menu));
+    }
     app.session.ctrl_down = p.mods.ctrl;
     ui.input(|i| {
         for event in &i.raw.events {
@@ -892,12 +901,15 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // draws the others.
     let tiles = tile_rects(app, full);
     let rect = tiles.iter().find(|(_, tile)| tile.active).map_or(full, |(r, _)| *r);
-    let resp = ui.interact(full, crate::framework::drawing_id(), Sense::click_and_drag());
+    let dialog_active = app.session.dialog_active();
+    let accepts_point = !dialog_active || app.session.dialog_waiting_for_point();
+    let sense = if accepts_point { Sense::click_and_drag() } else { Sense::hover() };
+    let resp = ui.interact(full, crate::framework::drawing_id(), sense);
     focus_on_press(&resp);
     let painter = ui.painter_at(rect);
     app.canvas.rect = Some(rect);
     app.session.viewport_px = (f64::from(rect.width()).max(1.0), f64::from(rect.height()).max(1.0));
-    if app.canvas.zoom_pending {
+    if app.canvas.zoom_pending && !dialog_active {
         app.canvas.zoom_pending = false;
         let _ = app.session.zoom_extents();
     }
@@ -919,8 +931,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         dbl_primary: i.pointer.button_double_clicked(egui::PointerButton::Primary),
     });
     let navigation = Navigation { rect, tiles: &tiles, response: &resp, xf, pointer };
-    let Some((inside, on_menu)) = navigate_canvas(app, ui, &navigation) else { return };
+    let Some((inside, on_menu)) = navigate_canvas(app, ui, &navigation, accepts_point) else { return };
     let PointerInput { hover_pos, mods, middle_down, pressed_primary, pressed_secondary, dbl_primary, .. } = pointer;
+    let dbl_primary = dbl_primary && !dialog_active;
     // Re-read the view after navigation.
     let view = app.session.state().map(|s| s.view()).unwrap_or(view);
     let scale = f64::from(rect.height()) / view.height.max(1e-12);

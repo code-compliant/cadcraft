@@ -46,6 +46,7 @@ fn install_io() {
         plot: Some(|d, space, opts| cadcraft_io::plotter::plot(d, space, opts).map_err(|e| e.to_string())),
     });
     cadcraft_engine::cmd::file::set_image_decoder(|b| cadcraft_io::raster::decode(b).map_err(|e| e.to_string()));
+    cadcraft_engine::lisp::set_slide_decoder(decode_slide, cadcraft_io::slide::library_span);
     cadcraft_engine::cmd::file::set_write_as(|d, name, o| {
         cadcraft_io::write_with(d, name, &cadcraft_io::SaveOptions { version: o.version, binary: o.binary }).map_err(|e| e.to_string())
     });
@@ -61,6 +62,27 @@ fn install_io() {
     cadcraft_engine::cmd::file::set_proxies_lost(cadcraft_io::proxies_lost);
     cadcraft_engine::cmd::file::set_dwg_compat_lost(cadcraft_io::dwg_compat_lost);
     cadcraft_engine::cmd::file::set_dwg_notes(cadcraft_io::dwg_notes);
+}
+
+fn decode_slide(bytes: &[u8]) -> Option<cadcraft_engine::lisp::SlideSource> {
+    use cadcraft_engine::lisp::{SlideSource, SlideSourcePrimitive, SlideSourceSolid, SlideSourceVector};
+    use cadcraft_io::slide::SlidePrim;
+
+    let slide = cadcraft_io::slide::decode(bytes)?;
+    let primitives = slide
+        .prims
+        .into_iter()
+        .map(|prim| match prim {
+            SlidePrim::Vector(line) => {
+                SlideSourcePrimitive::Vector(SlideSourceVector { x1: line.from.x, y1: line.from.y, x2: line.to.x, y2: line.to.y, color: line.color })
+            }
+            SlidePrim::Solid(solid) => SlideSourcePrimitive::Solid(SlideSourceSolid {
+                points: solid.points.into_iter().map(|point| (point.x, point.y)).collect(),
+                color: solid.color,
+            }),
+        })
+        .collect();
+    Some(SlideSource { high_x: slide.high_x, high_y: slide.high_y, primitives })
 }
 
 /// `path` as text, for the engine and io calls that take a file name as a string.

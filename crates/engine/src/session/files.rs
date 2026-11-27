@@ -45,11 +45,11 @@ impl Session {
         self.doc_epoch = self.doc_epoch.wrapping_add(1);
     }
 
-    /// A command still waiting for input belongs to the drawing it started in: end it there
-    /// before another drawing becomes current, so its undo step lands in that drawing.
-    fn end_running(&mut self) {
-        if self.running.is_some() {
-            self.cancel();
+    /// End a command or Lisp run in its own drawing before closing or changing drawings.
+    /// A Lisp cancellation handler may edit or close drawings. Read their state again afterward.
+    pub fn end_running(&mut self) {
+        if self.running.is_some() || self.lisp_waiting() {
+            self.cancel_for_drawing_change();
         }
     }
 

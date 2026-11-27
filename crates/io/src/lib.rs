@@ -24,6 +24,8 @@ pub mod plotter;
 pub mod raster;
 /// Open → save → reopen comparison and the real-file corpus harness (gaps FF1, FF5).
 pub mod roundtrip;
+/// AutoCAD level 2 slide files and slide-library members.
+pub mod slide;
 pub mod svg;
 mod svg_read;
 

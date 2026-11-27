@@ -669,6 +669,9 @@ impl DockPanels<Panel> for Panels<'_> {
     /// Render `panel`'s existing view; Layers, Properties and External References scroll independently.
     fn body(&mut self, panel: &Panel, ui: &mut egui::Ui, _: &mut BodyCx<'_>) {
         let app = &mut *self.app;
+        if app.session.dialog_active() {
+            ui.disable();
+        }
         match panel {
             // The drawing is its group's `group_view`.
             Panel::Canvas => {}

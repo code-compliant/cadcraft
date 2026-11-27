@@ -25,6 +25,10 @@ impl Session {
         let mut rest = line;
         let mut first = true;
         loop {
+            // A callback prompt takes one answer while the dialog owns command-line input.
+            if self.dialog_active() {
+                return if self.lisp_prompt().is_some() { self.typed(rest) } else { Ok(()) };
+            }
             if self.running.is_none() {
                 if !script && !first {
                     return Ok(());
@@ -77,6 +81,11 @@ impl Session {
     /// let `(setq q "!q")` evaluate itself forever and overflow the stack (#1920).
     fn typed_token(&mut self, t: &str, lisp: bool) -> Result<()> {
         let Some(prompt) = self.current_prompt() else { return Ok(()) };
+        let modal = self.dialog_active();
+        // At a raw text callback prompt, spaces are part of the answer.
+        if modal && !t.is_empty() && prompt.raw && prompt.accept.text && !prompt.accept.point && !prompt.accept.number {
+            return self.input(Input::Text(t.to_owned()));
+        }
         let tt = t.trim();
         if tt.is_empty() {
             return self.input(Input::Enter);
@@ -86,12 +95,12 @@ impl Session {
             return r;
         }
         // Transparent command.
-        if tt.starts_with('\'') {
+        if !modal && tt.starts_with('\'') {
             return self.start(tt);
         }
         // A LISP expression typed at a command's prompt: its value is the answer.
         // Not at a free-text prompt: there the text is the answer (CAL takes "(3+4)*2").
-        if lisp && lisp_expression(tt) && !prompt.accept.text && self.lisp_prompt().is_none() && !self.lisp_groups_undo() {
+        if lisp && lisp_expression(tt) && !prompt.accept.text && self.lisp_prompt().is_none() && !self.lisp_running() {
             let src = tt.strip_prefix('!').unwrap_or(tt).to_string();
             let v = match self.lisp_eval(&src, false, true, Vec::new()) {
                 Ok(Some(Ok(v))) => v,

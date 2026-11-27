@@ -68,7 +68,11 @@ impl CadApp {
     /// about each drawing first and quit once all are dealt with. Returns whether the close has to
     /// wait (the caller then cancels the window close).
     pub fn request_quit(&mut self) -> bool {
-        if self.quit_confirmed || !self.session.docs.iter().any(|d| d.is_dirty()) {
+        if self.quit_confirmed {
+            return false;
+        }
+        self.session.end_running();
+        if !self.session.docs.iter().any(|d| d.is_dirty()) {
             return false;
         }
         if self.closing.is_none() {
@@ -92,6 +96,9 @@ impl CadApp {
         if choice != Choice::Cancel && self.pending_pick.as_ref().is_some_and(|p| p.for_close) {
             self.set_status("Answer the Save dialog first.");
             return;
+        }
+        if choice != Choice::Cancel {
+            self.session.end_running();
         }
         let i = match (choice, self.doc_index(uid)) {
             (Choice::Cancel, _) => {
@@ -149,6 +156,9 @@ impl CadApp {
 
     /// Go on closing after the drawing `uid` was asked to save with result `r`.
     fn close_after_save(&mut self, uid: u64, r: Result<Value, String>) {
+        if r.is_ok() {
+            self.session.end_running();
+        }
         let saved = r.is_ok() && self.doc_index(uid).and_then(|i| self.session.docs.get(i)).is_some_and(|d| !d.is_dirty());
         match (saved, self.doc_index(uid)) {
             (true, Some(i)) => {
@@ -203,6 +213,8 @@ impl CadApp {
                 }
                 return;
             };
+            // A cancellation handler can edit or close the target before the save check.
+            self.session.end_running();
             let Some(i) = self.doc_index(uid) else {
                 if let Some(c) = &mut self.closing {
                     c.queue.pop_front();
@@ -340,6 +352,38 @@ mod tests {
         app.request_close(Some(0));
         assert!(app.closing.is_none());
         assert_eq!(titles(&app), ["B"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn close_checks_edits_from_the_dialog_cancellation_handler() {
+        let path = std::env::temp_dir().join(format!("cadcraft-dcl-close-{}.dcl", std::process::id()));
+        std::fs::write(&path, "probe : dialog {}\n").unwrap();
+        let quoted = path.display().to_string().replace('\\', "\\\\").replace('"', "\\\"");
+        let source = format!(
+            r#"((lambda (/ *error*)
+                 (setq *error* (lambda (msg) (command "_.LINE" '(0 0) '(10 0) "")))
+                 (setq h (load_dialog "{quoted}")) (new_dialog "probe" h) (start_dialog)))"#
+        );
+        for quit in [false, true] {
+            let mut app = app_with(&["A"]);
+            assert!(!app.session.state().unwrap().is_dirty());
+            app.session.cmdline(&source).unwrap();
+            assert!(app.session.dialog_active());
+
+            if quit {
+                assert!(close_frame(&mut app, &egui::Context::default()));
+            } else {
+                app.request_close(Some(0));
+            }
+
+            assert_eq!(app.close_prompt(), Some("A"));
+            assert!(!app.session.dialog_active());
+            assert_eq!(app.session.doc().unwrap().entity_count(), 1);
+            app.answer_close(Choice::Cancel);
+            assert!(app.session.state().unwrap().is_dirty());
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

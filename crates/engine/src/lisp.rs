@@ -10,7 +10,9 @@ pub type BlockSlots = HashMap<Handle, (Arc<cadcraft_doc::Entity>, Option<Handle>
 
 pub mod builtins;
 pub mod dcl;
+mod dcl_image;
 mod dcl_load;
+mod dcl_prepare;
 mod drawing;
 pub mod eval;
 pub mod input;
@@ -62,6 +64,10 @@ pub struct Env {
     dialogs: HashMap<i32, dcl_load::LoadedDialog>,
     /// Next handle to try. Unload frees a handle so a later load can reuse it.
     next_dialog: i32,
+    /// The one dialog `new_dialog` prepared in this drawing, if any.
+    prepared: Option<dcl_prepare::PreparedDialog>,
+    /// The dialog `start_dialog` is waiting on, if one is active.
+    dialog: dcl_prepare::DialogRun,
     /// Entities `entdel` deleted (it brings them back when called again), with their space.
     pub deleted: HashMap<Handle, (cadcraft_doc::Space, Arc<cadcraft_doc::Entity>)>,
     /// Every entity's handle in creation order (`entlast`, `entnext`), with clones of the spaces
@@ -94,6 +100,8 @@ impl Default for Env {
             next_file: 1,
             dialogs: HashMap::new(),
             next_dialog: 1,
+            prepared: None,
+            dialog: dcl_prepare::DialogRun::default(),
             deleted: HashMap::new(),
             order: None,
             block_next: None,
@@ -142,6 +150,10 @@ pub struct LispState {
     autoloaded: std::collections::HashSet<u64>,
     /// `acad.lsp` was loaded this session.
     acad_loaded: bool,
+    /// Next session-unique id for a dialog `start_dialog` activates.
+    next_dialog_id: u64,
+    /// Why this slice must refuse `start_dialog`. Empty for an interactive run.
+    dialog_refusal: Option<&'static str>,
     /// Memory caps (lowered by tests).
     pub(crate) limits: Limits,
     /// Interpreter steps all synchronous callbacks have run, nested ones included. A callback's
@@ -208,10 +220,14 @@ struct Run {
     inputs: std::collections::VecDeque<Value>,
     /// Run to the end without waiting (programmatic calls): `get…` without an input gets nil.
     blocking: bool,
+    /// The run began inside a script. A later yield must not drop that rule.
+    scripted: bool,
     /// Steps taken, for the cap on blocking runs.
     steps: u64,
     /// The `*error*` handler is the one running.
     handler: bool,
+    /// A drawing change needs the handler's native command to end within this undo group.
+    finish_native_command: bool,
     /// Bytes of strings and printed text the run has made ([`value::charge_bytes`]).
     string_bytes: u64,
     /// Cons cells alive when the run started: cells the drawing's variables already hold don't
@@ -225,9 +241,8 @@ const SLICE: u64 = 400_000;
 const BLOCKING_CAP: u64 = 500_000_000;
 
 impl Session {
-    /// The LISP environment of the active drawing.
-    fn lisp_env_take(&mut self) -> Env {
-        let uid = self.state().map(|s| s.uid).unwrap_or(0);
+    /// The LISP environment of drawing `uid`, not whichever drawing is active now.
+    fn lisp_env_take(&mut self, uid: u64) -> Env {
         self.lisp.envs.remove(&uid).unwrap_or_default()
     }
 
@@ -251,10 +266,10 @@ impl Session {
         self.lisp.active
     }
 
-    /// A prompt waits for input: a command's, or a LISP routine's `get…` function. Clicks and
-    /// typing answer it; with none, the interface is idle (clicks select, Delete erases).
+    /// Whether a drawing command, LISP input prompt, or modal dialog owns the input.
+    /// Idle drawing input becomes available when all of these finish.
     pub fn prompting(&self) -> bool {
-        self.running.is_some() || self.lisp_prompt().is_some()
+        self.running.is_some() || self.lisp_prompt().is_some() || self.dialog_active()
     }
 
     /// A routine is stopped, waiting for input or for a frame.
@@ -313,8 +328,10 @@ impl Session {
             before,
             inputs: inputs.into(),
             blocking,
+            scripted: self.in_script,
             steps: 0,
             handler: false,
+            finish_native_command: false,
             string_bytes: 0,
             cells_at_start: value::live_cells(),
         }));
@@ -368,7 +385,7 @@ impl Session {
                 self.lisp_abort("Function cancelled");
                 return;
             }
-            let mut env = self.lisp_env_take();
+            let mut env = self.lisp_env_take(run.uid);
             value::set_string_budget(run.string_bytes, self.lisp.limits.string_bytes);
             value::set_cell_limit(self.lisp.limits.cells.max(run.cells_at_start));
             // What the routine feeds the command line is the program's input: the command it
@@ -376,12 +393,14 @@ impl Session {
             // [`Session::typed`] first, never opens a dialog. Restored after the slice, a panic
             // in it included, so a person's later command keeps its own origin.
             let program_input = std::mem::replace(&mut self.program_input, true);
+            self.lisp.dialog_refusal = dialog_refusal_of(&run);
             let outcome = {
                 let machine = &mut run.machine;
                 let mut ctx = Ctx { s: self, env: &mut env, depth: 0 };
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine.run(&mut ctx, SLICE)))
             };
             self.program_input = program_input;
+            self.lisp.dialog_refusal = None;
             run.string_bytes = value::string_bytes_used();
             let outcome = match outcome {
                 Ok(o) => o,
@@ -408,6 +427,12 @@ impl Session {
                 self.lisp_error(LispError::quit(format!("routine stopped after {BLOCKING_CAP} steps")));
                 return;
             }
+            // A command in this slice may have changed drawings. A wait needs its owning drawing.
+            if matches!(&outcome, Outcome::Wait(_)) && self.state().map(|s| s.uid).ok() != Some(uid) {
+                self.lisp.run = Some(run);
+                self.lisp_abort("Function cancelled");
+                return;
+            }
             match outcome {
                 Outcome::Done(v) => {
                     self.lisp.run = Some(run);
@@ -420,7 +445,14 @@ impl Session {
                     return;
                 }
                 Outcome::Wait(Need::Yield) => {
-                    if run.blocking {
+                    // A script must finish this slice before its next line. The script flag
+                    // itself is gone once `script` returns.
+                    if run.blocking || run.scripted {
+                        if run.steps > BLOCKING_CAP {
+                            self.lisp.run = Some(run);
+                            self.lisp_error(LispError::quit(format!("routine stopped after {BLOCKING_CAP} steps")));
+                            return;
+                        }
                         self.lisp.run = Some(run);
                         continue;
                     }
@@ -440,6 +472,30 @@ impl Session {
                         continue;
                     }
                     run.waiting = Some(Need::Pause);
+                    self.lisp.run = Some(run);
+                    return;
+                }
+                Outcome::Wait(Need::Dialog) => {
+                    // A callback that finished without closing returns here with the dialog already
+                    // active. Activating again would drop the status and the position it recorded.
+                    // A blocking or scripted start never reaches this arm: the evaluator raises it.
+                    if self.lisp.envs.get(&run.uid).is_some_and(|env| env.dialog.active()) {
+                        run.waiting = Some(Need::Dialog);
+                        self.lisp.run = Some(run);
+                        return;
+                    }
+                    let position = self.lisp.envs.get(&run.uid).and_then(|env| env.prepared.as_ref().map(|dialog| dialog.position));
+                    if position.is_none() {
+                        run.machine.resume(Value::Nil);
+                        self.lisp.run = Some(run);
+                        continue;
+                    }
+                    self.lisp.next_dialog_id = self.lisp.next_dialog_id.saturating_add(1);
+                    let id = self.lisp.next_dialog_id;
+                    if let Some(env) = self.lisp.envs.get_mut(&run.uid) {
+                        env.dialog.activate(id, position.flatten());
+                    }
+                    run.waiting = Some(Need::Dialog);
                     self.lisp.run = Some(run);
                     return;
                 }
@@ -490,7 +546,14 @@ impl Session {
     /// The routine finished: print its value (command-line expressions), record its undo step.
     fn lisp_end(&mut self, result: std::result::Result<Value, String>) {
         let Some(run) = self.lisp.run.take() else { return };
+        if run.finish_native_command && self.running.is_some() && self.state().map(|st| st.uid).ok() == Some(run.uid) {
+            // Keep the routine's undo group open until its command finishes in this drawing.
+            self.cancel();
+        }
         self.lisp.active = false;
+        if let Some(env) = self.lisp.envs.get_mut(&run.uid) {
+            env.dialog.deactivate();
+        }
         let steps = std::mem::take(&mut self.lisp.steps);
         let mut env = self.lisp.envs.remove(&run.uid).unwrap_or_default();
         self.lisp_flush(&mut env, true);
@@ -514,22 +577,26 @@ impl Session {
     /// A LISP error: run `*error*` when the routine defined one, else print it.
     fn lisp_error(&mut self, e: LispError) {
         let Some(mut run) = self.lisp.run.take() else { return };
+        let uid = run.uid;
+        // Keep the handler's locals until it returns. A normal error already restored these.
+        let restores = run.machine.take_unwind_bindings();
         // A block definition the failed routine began is dropped: a later routine's entities
         // would otherwise go into it instead of the drawing (#1662). A definition still spans
         // runs that end normally.
-        if let Some(env) = self.lisp.envs.get_mut(&run.uid) {
+        if let Some(env) = self.lisp.envs.get_mut(&uid) {
             env.pending_block = None;
+            env.dialog.deactivate();
         }
         // The command a failed routine left running is cancelled.
         if self.running.is_some() {
             self.cancel();
         }
-        let handler = self.lisp.envs.get(&run.uid).map(|env| env.get("*ERROR*")).unwrap_or_default();
-        if !run.handler && matches!(handler, Value::Func(_) | Value::Subr(_)) {
+        let handler = self.lisp.envs.get(&uid).map(|env| env.get("*ERROR*")).unwrap_or_default();
+        if !run.handler && self.state().map(|s| s.uid).ok() == Some(uid) && matches!(handler, Value::Func(_) | Value::Subr(_)) {
             run.handler = true;
             run.waiting = None;
             run.print = false;
-            run.machine = Machine::calling(handler, vec![Value::str(&e.msg)]);
+            run.machine = Machine::calling_then_restore(handler, vec![Value::str(&e.msg)], restores);
             self.lisp.run = Some(run);
             self.lisp_drive();
             // The routine failed whatever its handler returned.
@@ -538,10 +605,14 @@ impl Session {
             }
             return;
         }
+        if let Some(env) = self.lisp.envs.get_mut(&uid) {
+            for group in restores {
+                eval::restore_bindings(env, group);
+            }
+        }
         self.lisp.run = Some(run);
-        let mut env = self.lisp_env_take();
+        let mut env = self.lisp_env_take(uid);
         self.lisp_flush(&mut env, true);
-        let uid = self.state().map(|s| s.uid).unwrap_or(0);
         self.lisp_env_put(uid, env);
         self.echo(format!("; error: {}", e.msg));
         self.lisp_end(Err(e.msg));
@@ -567,10 +638,51 @@ impl Session {
         }
     }
 
+    /// End input and unwind a cancellation handler that waits during a drawing change.
+    pub(crate) fn cancel_for_drawing_change(&mut self) {
+        if let Some(run) = self.lisp.run.as_mut() {
+            run.finish_native_command = true;
+        }
+        self.cancel();
+        if self.lisp_waiting() {
+            self.lisp_abort("Function cancelled");
+        }
+        // A handler may itself switch drawings and begin a command there.
+        if self.running.is_some() {
+            self.cancel();
+        }
+    }
+
     /// Stop the routine (Esc while it waits, its drawing closed) with `msg` as its error.
     pub fn lisp_abort(&mut self, msg: &str) {
         if self.lisp.run.is_some() {
+            // Leave the local `*error*` handler and its locals in place. `lisp_error` restores
+            // the outer bindings after that handler returns.
             self.lisp_error(LispError::quit(msg));
+        }
+    }
+
+    /// An event or callback failed. Unwind to a surrounding `vl-catch-all-apply` when there is one.
+    fn raise_dialog_error(&mut self, mut run: Box<Run>, mut env: Env, error: LispError) {
+        let uid = run.uid;
+        let message = error.msg.clone();
+        let quit = error.quit;
+        let caught = {
+            let mut ctx = Ctx { s: self, env: &mut env, depth: 0 };
+            run.machine.raise(&mut ctx, error).is_none()
+        };
+        if !caught || !env.dialog.in_action() {
+            env.dialog.deactivate();
+        }
+        self.lisp_env_put(uid, env);
+        run.waiting = None;
+        self.lisp.run = Some(run);
+        if caught {
+            self.lisp_drive();
+        } else if quit {
+            self.lisp_error(LispError::quit(message));
+        } else {
+            self.lisp_error(LispError::new(message));
         }
     }
 
@@ -602,6 +714,160 @@ impl Session {
             input::GetKind::Point | input::GetKind::Dist | input::GetKind::Angle { .. } => vec![line(b, cursor)],
             _ => Vec::new(),
         })
+    }
+
+    /// Give a tile event to the dialog `start_dialog` is waiting on. An event whose id is not the
+    /// active dialog, including one from a dialog that already closed, leaves the session unchanged.
+    pub fn dialog_event(&mut self, event: DialogEvent<'_>) -> crate::Result<DialogEventOutcome> {
+        if !self.lisp.run.as_ref().is_some_and(|run| matches!(run.waiting, Some(Need::Dialog))) {
+            return Ok(DialogEventOutcome::Ignored);
+        }
+        let Some(mut run) = self.lisp.run.take() else { return Ok(DialogEventOutcome::Ignored) };
+        let uid = run.uid;
+        if self.state().map(|st| st.uid).ok() != Some(uid) {
+            self.lisp.run = Some(run);
+            self.lisp_abort("Function cancelled");
+            return Ok(DialogEventOutcome::Ignored);
+        }
+        let mut env = self.lisp_env_take(uid);
+        if env.dialog.id() != event.id || event.position.is_some_and(|(x, y)| !x.is_finite() || !y.is_finite()) {
+            self.lisp_env_put(uid, env);
+            self.lisp.run = Some(run);
+            return Ok(DialogEventOutcome::Ignored);
+        }
+        let dispatch = env.prepared.as_ref().map(|dialog| dialog.action_for(event.key)).unwrap_or(dcl_prepare::DialogDispatch::Missing);
+        if let Some(text) = event.value
+            && !matches!(dispatch, dcl_prepare::DialogDispatch::Missing | dcl_prepare::DialogDispatch::Ignore)
+            && let Some(dialog) = env.prepared.as_ref()
+        {
+            let rejection = if !dialog.can_set_tile(event.key, text.len()) {
+                Some(DialogEventOutcome::TextLimit)
+            } else if !dialog.valid_event_value(event.key, text) {
+                Some(DialogEventOutcome::Ignored)
+            } else {
+                None
+            };
+            if let Some(outcome) = rejection {
+                self.lisp_env_put(uid, env);
+                self.lisp.run = Some(run);
+                return Ok(outcome);
+            }
+        }
+        match dispatch {
+            dcl_prepare::DialogDispatch::Missing | dcl_prepare::DialogDispatch::Ignore => {
+                self.lisp_env_put(uid, env);
+                self.lisp.run = Some(run);
+                Ok(DialogEventOutcome::Ignored)
+            }
+            dcl_prepare::DialogDispatch::Update | dcl_prepare::DialogDispatch::Close(_) => {
+                if let Err(error) = charge_dialog_event(&mut run, self.lisp.limits.string_bytes, 0, event.value, None) {
+                    self.raise_dialog_error(run, env, error);
+                    return Ok(DialogEventOutcome::Ignored);
+                }
+                apply_dialog_edit(&mut env, event.key, event.value, event.position);
+                if let dcl_prepare::DialogDispatch::Close(status) = dispatch {
+                    env.dialog.deactivate();
+                    run.waiting = None;
+                    run.machine.resume(Value::Int(status));
+                }
+                self.lisp_env_put(uid, env);
+                let resume = run.waiting.is_none();
+                self.lisp.run = Some(run);
+                if resume {
+                    self.lisp_drive();
+                }
+                Ok(DialogEventOutcome::Applied)
+            }
+            dcl_prepare::DialogDispatch::Run(action) => match self.prepare_dialog_action(&mut env, &mut run, &event, &action) {
+                Ok(()) => {
+                    self.lisp_env_put(uid, env);
+                    self.lisp.run = Some(run);
+                    self.lisp_drive();
+                    Ok(DialogEventOutcome::Applied)
+                }
+                Err(error) => {
+                    self.raise_dialog_error(run, env, error);
+                    Ok(DialogEventOutcome::Ignored)
+                }
+            },
+        }
+    }
+
+    /// Parse and bind one callback. The run's string budget pays before the parse and the new strings.
+    fn prepare_dialog_action(&mut self, env: &mut Env, run: &mut Run, event: &dcl_prepare::DialogEvent<'_>, action: &str) -> Result<(), LispError> {
+        charge_dialog_event(run, self.lisp.limits.string_bytes, event.key.len(), event.value, Some(action))?;
+        let forms = read::read_all(action)?;
+        apply_dialog_edit(env, event.key, event.value, event.position);
+        let value = env.prepared.as_ref().and_then(|dialog| dialog.get_tile(event.key)).unwrap_or_else(|| Arc::from(""));
+        let saved = bind_dialog_action(env, event.key, value, event.reason);
+        env.dialog.begin_action();
+        run.waiting = None;
+        run.machine.run_dialog_action(forms, saved);
+        Ok(())
+    }
+
+    /// The session-unique id of the active dialog, for the native adapter.
+    pub fn dialog_id(&self) -> Option<u64> {
+        let uid = self.state().ok()?.uid;
+        let dialog = &self.lisp.envs.get(&uid)?.dialog;
+        dialog.active().then_some(dialog.id()).filter(|id| *id != 0)
+    }
+
+    /// Whether `start_dialog` is waiting, or one of its callbacks is running.
+    pub fn dialog_active(&self) -> bool {
+        let Ok(uid) = self.state().map(|st| st.uid) else { return false };
+        self.lisp.envs.get(&uid).is_some_and(|env| env.dialog.active())
+    }
+
+    /// Refuse drawing input while a DCL dialog owns it.
+    pub fn require_dialog_closed(&self, command: &str) -> crate::Result<()> {
+        if self.dialog_active() {
+            return Err(crate::EngineError::Disabled(command.into(), "close the active DCL dialog before editing the drawing".into()));
+        }
+        Ok(())
+    }
+
+    /// `Some(false)` when `mode_tile` disabled the tile or an enclosing cluster. `None` for an unknown key.
+    pub fn dialog_tile_enabled(&self, key: &str) -> Option<bool> {
+        let uid = self.state().ok()?.uid;
+        self.lisp.envs.get(&uid)?.prepared.as_ref()?.tile_enabled(key)
+    }
+
+    /// A callback can rebuild a list before the native adapter sends a queued click.
+    /// A double-click commit can follow an applied selection while its row survives at the same index.
+    pub fn dialog_list_rows_current(&self, key: &str, rows: &Arc<Vec<Arc<str>>>, commit_at: Option<usize>) -> bool {
+        let Ok(uid) = self.state().map(|st| st.uid) else { return false };
+        self.lisp.envs.get(&uid).and_then(|env| env.prepared.as_ref()).is_some_and(|dialog| dialog.list_rows_current(key, rows, commit_at))
+    }
+
+    /// Whether the routine is ready for tile events. A suspended callback owns its own prompt.
+    pub fn dialog_waiting_for_tile(&self) -> bool {
+        self.dialog_active() && self.lisp.run.as_ref().is_some_and(|run| matches!(run.waiting, Some(Need::Dialog)))
+    }
+
+    /// Whether a dialog callback is waiting for a point from the drawing.
+    pub fn dialog_waiting_for_point(&self) -> bool {
+        self.dialog_active() && self.lisp_prompt().is_some_and(|prompt| prompt.accept.point)
+    }
+
+    /// The waiting dialog's title and controls in source order.
+    pub fn dialog_view(&self) -> Option<dcl_prepare::DialogView> {
+        if !self.dialog_waiting_for_tile() {
+            return None;
+        }
+        let uid = self.state().ok()?.uid;
+        let env = self.lisp.envs.get(&uid)?;
+        let id = env.dialog.id();
+        if id == 0 {
+            return None;
+        }
+        env.prepared.as_ref().map(|dialog| dialog.view(id))
+    }
+
+    /// Drain focus, selection, and highlight requests so the adapter applies each once.
+    pub fn take_dialog_requests(&mut self) -> Vec<dcl_prepare::DialogRequest> {
+        let Ok(uid) = self.state().map(|st| st.uid) else { return Vec::new() };
+        self.lisp.envs.get_mut(&uid).and_then(|env| env.prepared.as_mut()).map(|dialog| dialog.take_requests()).unwrap_or_default()
     }
 
     /// Give an input to a waiting routine. `true` when the routine took it.
@@ -648,9 +914,9 @@ impl Session {
         }
     }
 
-    /// Whether commands' undo steps go into a running routine's (one step per routine).
+    /// Whether the active drawing owns the running routine's undo group.
     pub(crate) fn lisp_groups_undo(&self) -> bool {
-        self.lisp.active
+        self.routine_steps().is_some()
     }
 
     /// A command the running routine ran changed the drawing (`snap` holds it as it was): U inside
@@ -744,6 +1010,11 @@ impl Session {
     }
 }
 
+pub use dcl_image::{SlideSource, SlideSourcePrimitive, SlideSourceSolid, SlideSourceVector, set_slide_decoder};
+pub use dcl_prepare::{
+    DialogControl, DialogEvent, DialogEventOutcome, DialogImage, DialogPicture, DialogPrimitive, DialogRequest, DialogSolid, DialogVector, DialogView,
+};
+
 pub(crate) use drawing::from_json as drawing_from_json;
 pub(crate) use drawing::load_source;
 
@@ -765,6 +1036,56 @@ impl Session {
             self.echo(format!("{shown} successfully loaded."));
         }
         Ok(r)
+    }
+}
+
+/// Count the callback source, the new key, and an accepted edit before any of them is allocated.
+fn charge_dialog_event(run: &mut Run, budget: u64, key_bytes: usize, value: Option<&str>, action: Option<&str>) -> Result<(), LispError> {
+    value::set_string_budget(run.string_bytes, budget);
+    let bytes = key_bytes.saturating_add(value.map_or(0, str::len)).saturating_add(action.map_or(0, str::len));
+    let charged = value::charge_bytes(bytes);
+    run.string_bytes = value::string_bytes_used();
+    charged
+}
+
+/// Store an accepted edit and the dialog position. Rejected events never call this.
+fn apply_dialog_edit(env: &mut Env, key: &str, value: Option<&str>, position: Option<(f64, f64)>) {
+    if let Some(position) = position {
+        env.dialog.set_position(position);
+    }
+    if let Some(text) = value
+        && let Some(dialog) = env.prepared.as_mut()
+    {
+        let _ = dialog.set_tile(key, Arc::from(text));
+    }
+}
+
+/// Bind the callback variables and remember their previous values for the frame that restores them.
+fn bind_dialog_action(env: &mut Env, key: &str, value: Arc<str>, reason: i32) -> Vec<(Sym, Option<Value>)> {
+    let bindings = [
+        (Sym::new("$KEY"), Value::Str(Arc::from(key))),
+        (Sym::new("$VALUE"), Value::Str(value)),
+        (Sym::new("$REASON"), Value::Int(reason)),
+        (Sym::new("$DATA"), Value::Nil),
+        (Sym::new("$X"), Value::Nil),
+        (Sym::new("$Y"), Value::Nil),
+    ];
+    let mut saved = Vec::with_capacity(bindings.len());
+    for (sym, bound) in bindings {
+        saved.push((sym.clone(), env.globals.get(&sym).cloned()));
+        env.set(&sym, bound);
+    }
+    saved
+}
+
+/// Why `start_dialog` must fail for this run, before the dialog is activated.
+fn dialog_refusal_of(run: &Run) -> Option<&'static str> {
+    if run.blocking {
+        Some("a dialog cannot start from a blocking call")
+    } else if run.scripted {
+        Some("a dialog cannot start from a script")
+    } else {
+        None
     }
 }
 

@@ -8,6 +8,9 @@ impl Session {
     /// the next point, where the drag ends, closes it). Only while objects are being selected: no
     /// command running, or a command asking for objects. Returns whether a window was opened.
     pub fn begin_window(&mut self, corner: Vec2) -> bool {
+        if self.dialog_active() {
+            return false;
+        }
         let during_command = self.running.is_some();
         if !self.settings.pickdrag || !corner.is_finite() || (during_command && !self.current_prompt().is_some_and(|p| p.accept.select)) {
             return false;
@@ -28,6 +31,9 @@ impl Session {
     /// PICKADD on (the default): picks add to the selection and Shift removes. PICKADD off: each pick
     /// replaces the selection and Shift adds (Shift+pick on a selected object removes it).
     pub fn idle_click(&mut self, p: Vec2, shift: bool) -> Result<()> {
+        if self.dialog_active() {
+            return Ok(());
+        }
         let space = self.space();
         let pickadd = self.settings.pickadd;
         if let Some(pw) = self.pending_window.take() {
@@ -69,6 +75,9 @@ impl Session {
     /// Whether a click at `p` selects objects by picking: no command running, or a command at
     /// "Select objects" with no selection window or typed mode under way.
     pub fn click_picks(&self) -> bool {
+        if self.dialog_active() {
+            return false;
+        }
         self.pending_window.is_none()
             && match self.running.as_ref() {
                 None => self.lisp_prompt().is_none(),
@@ -114,6 +123,9 @@ impl Session {
     /// Pick `h` from the selection cycling list, as a click on it alone would have: into the
     /// command at "Select objects", else into the selection (Shift as for [`Self::idle_click`]).
     pub fn pick_cycled(&mut self, h: Handle, shift: bool) -> Result<()> {
+        if self.dialog_active() {
+            return Ok(());
+        }
         // The list may be older than an undo or an erase.
         if self.doc()?.entity(h).is_none() {
             return Ok(());

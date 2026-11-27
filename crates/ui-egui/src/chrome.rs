@@ -321,6 +321,11 @@ fn draw_status_toggles(
 pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     egui::Panel::bottom("cc_status").exact_size(26.0).frame(egui::Frame::NONE.fill(t.chrome)).show(ui, |ui| {
+        let modal = app.session.dialog_active();
+        if modal {
+            // Keep the status readout visible while the dialog owns drawing input.
+            ui.disable();
+        }
         let r = ui.max_rect();
         let p = ui.painter().clone();
         let mut x = r.left() + 8.0;
@@ -335,7 +340,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         for (icon, tip) in [(Icon::Plus, "New layout"), (Icon::Menu, "Layout list")] {
             let br = Rect::from_min_size(pos2(x, r.top() + 4.0), vec2(18.0, 18.0));
             let resp = ui.interact(br, ui.scope_id().with(("sb", tip)), Sense::click());
-            icons::paint(&p, br.shrink(2.0), icon, false);
+            icons::paint(&p, br.shrink(2.0), icon, modal);
             icons::describe_control(ui, &resp, tip, None, false);
             let resp = resp.on_hover_text(crate::i18n::t(tip));
             if icon == Icon::Plus {
@@ -450,12 +455,14 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             if resp.clicked() {
                 switch = Some(name.clone());
             }
-            crate::shortcut_menus::attach(app, &resp, |app| crate::shortcut_menus::layout_tab_entries(app, name));
+            if !modal {
+                crate::shortcut_menus::attach(app, &resp, |app| crate::shortcut_menus::layout_tab_entries(app, name));
+            }
             x += w + 2.0;
             if i == 0 {
                 let pr = Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(16.0, 16.0));
                 let presp = ui.interact(pr, ui.scope_id().with("layout_plus"), Sense::click());
-                icons::paint(&p, pr.shrink(2.0), Icon::Plus, false);
+                icons::paint(&p, pr.shrink(2.0), Icon::Plus, modal);
                 icons::describe_control(ui, &presp, "New layout", None, false);
                 if presp.on_hover_text(crate::tl!("New layout")).clicked()
                     && let Ok(v) = app.run("layout.new", json!({}))
@@ -478,7 +485,7 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
             x += 22.0;
             resp.on_hover_text(crate::tl!("Layout list"))
         });
-        for resp in list_button.iter().chain(&more) {
+        for resp in list_button.iter().chain(&more).filter(|_| !modal) {
             egui::Popup::from_toggle_button_response(resp).width(200.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                     for (i, name) in tabs.iter().enumerate() {

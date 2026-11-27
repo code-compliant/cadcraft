@@ -146,7 +146,7 @@ pub fn status(app: &mut CadApp, ui: &mut egui::Ui, right: f32, cy: f32) -> f32 {
     p.line_segment([pos2(ax, ay + 1.5), pos2(ax + 3.0, ay - 1.5)], egui::Stroke::new(1.2, t.text_dim));
     let sresp = sresp.on_hover_text(if vp.locked { crate::tl!("Viewport is locked") } else { crate::tl!("Viewport scale") });
     let mut pick = None;
-    if !vp.locked {
+    if ui.is_enabled() && !vp.locked {
         egui::Popup::from_toggle_button_response(&sresp).width(150.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                 for (name, v) in scales(metric) {

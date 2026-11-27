@@ -1,6 +1,7 @@
 //! Dialogs: Drafting Settings, Drawing Units, About, command reference, blocks; dispatches the
 //! Layer Properties Manager ([`crate::layers`]), Quick Select ([`crate::quick`]), Parameters
 //! Manager ([`crate::parametric`]) and the style and settings managers ([`crate::managers`]).
+//! A prepared DCL dialog is drawn here while `start_dialog` is waiting.
 
 use egui::{RichText, vec2};
 use serde_json::json;
@@ -8,11 +9,14 @@ use serde_json::json;
 use crate::CadApp;
 use crate::theme::Tokens;
 
+mod dcl;
+
 pub fn show(app: &mut CadApp, ctx: &egui::Context) {
     crate::mtext_editor::show(app, ctx);
     crate::attentry::show(app, ctx);
     crate::line_editor::show(app, ctx);
     crate::quick::quick_properties(app, ctx);
+    dcl::dcl(app, ctx);
     let Some(d) = app.ui.dialog.clone() else { return };
     let mut open = true;
     match d.as_str() {

@@ -93,6 +93,8 @@ pub enum Frame {
         f: Value,
         args: Vec<Value>,
     },
+    /// A dialog callback finished: close `start_dialog`, or wait for the next tile.
+    DialogAction,
 }
 
 /// Special forms: their arguments are not evaluated first.
@@ -141,6 +143,9 @@ pub enum Need {
     Pause,
     /// The step budget ran out: let the interface draw a frame, then carry on.
     Yield,
+    /// `start_dialog` waits for a tile event. The session activates the dialog only after it
+    /// accepts the wait, so a blocking call never opens one.
+    Dialog,
 }
 
 /// How a run ended.
@@ -190,9 +195,51 @@ impl Machine {
         Machine { stack: Vec::new(), state: State::Call(f, args), need: None, used: 0 }
     }
 
+    /// Call `f`, then restore `groups` from the inside out. `groups[0]` is the innermost.
+    pub(crate) fn calling_then_restore(f: Value, args: Vec<Value>, groups: Vec<Vec<(Sym, Option<Value>)>>) -> Machine {
+        let mut stack = Vec::with_capacity(groups.len());
+        for group in groups.into_iter().rev() {
+            if !group.is_empty() {
+                stack.push(Frame::Unbind { saved: group });
+            }
+        }
+        Machine { stack, state: State::Call(f, args), need: None, used: 0 }
+    }
+
     /// Give the value a [`Need`] waited for, and carry on.
     pub fn resume(&mut self, v: Value) {
         self.state = State::Ret(v);
+    }
+
+    /// Drop the continuation. The first group is the innermost binding to restore after `*error*`.
+    pub(crate) fn take_unwind_bindings(&mut self) -> Vec<Vec<(Sym, Option<Value>)>> {
+        let mut groups = Vec::new();
+        while let Some(frame) = self.stack.pop() {
+            match frame {
+                Frame::Unbind { saved } => groups.push(saved),
+                Frame::Foreach { var, saved, .. } => groups.push(vec![(var, saved)]),
+                _ => {}
+            }
+        }
+        self.state = State::Ret(Value::Nil);
+        self.need = None;
+        groups
+    }
+
+    /// Raise `error` through the same unwind a failed form uses.
+    pub(crate) fn raise(&mut self, ctx: &mut Ctx<'_>, error: LispError) -> Option<Outcome> {
+        self.need = None;
+        self.unwind(ctx, error)
+    }
+
+    /// Evaluate `forms` as the active dialog's callback, then decide whether `start_dialog` ends.
+    /// `saved` is restored before that decision, including when the callback fails.
+    pub fn run_dialog_action(&mut self, forms: Vec<Value>, saved: Vec<(Sym, Option<Value>)>) {
+        self.stack.push(Frame::DialogAction);
+        self.stack.push(Frame::Unbind { saved });
+        self.stack.push(Frame::Forms { rest: forms.into_iter().rev().collect() });
+        self.state = State::Ret(Value::Nil);
+        self.need = None;
     }
 
     /// Run until done, waiting, or `budget` steps. A step that walks a long list (`length`) or
@@ -258,6 +305,7 @@ impl Machine {
             match frame {
                 Frame::Unbind { saved } => restore(ctx.env, saved),
                 Frame::Foreach { var, saved, .. } => restore(ctx.env, vec![(var, saved)]),
+                Frame::DialogAction => ctx.env.dialog.deactivate(),
                 Frame::Catch if !e.quit => {
                     self.state = State::Ret(super::builtins::catch_all_error(&e.msg));
                     return None;
@@ -406,6 +454,14 @@ impl Machine {
             },
             Frame::Catch => self.state = State::Ret(v),
             Frame::Resume { f, args } => self.state = State::Call(f, args),
+            Frame::DialogAction => match ctx.env.dialog.finish_action() {
+                Some(status) => self.state = State::Ret(Value::Int(status)),
+                None if ctx.env.dialog.active() => {
+                    self.state = State::Ret(Value::Nil);
+                    self.need = Some(Need::Dialog);
+                }
+                None => self.state = State::Ret(Value::Nil),
+            },
         }
         Ok(())
     }
@@ -554,7 +610,7 @@ impl Machine {
                     if let Flow::Value(v) = &flow {
                         super::value::charge_result(v)?;
                     }
-                    self.flow(flow);
+                    self.flow(ctx, flow)?;
                 }
                 BuiltinKind::Special(_) => return Err(LispError::new(format!("bad function: {}", b.name))),
             },
@@ -582,7 +638,7 @@ impl Machine {
         Ok(())
     }
 
-    fn flow(&mut self, flow: Flow) {
+    fn flow(&mut self, ctx: &mut Ctx<'_>, flow: Flow) -> Result<(), LispError> {
         match flow {
             Flow::Value(v) => self.state = State::Ret(v),
             Flow::Call(f, args) => self.state = State::Call(f, args),
@@ -610,17 +666,31 @@ impl Machine {
                 self.need = Some(need);
             }
             Flow::Wait(need) => {
+                // A forbidden dialog fails here, so a caught rejection stays in this step budget.
+                if matches!(need, Need::Dialog) {
+                    if let Some(message) = ctx.s.lisp.dialog_refusal {
+                        return Err(LispError::new(message));
+                    }
+                    if let Some(kind) = ctx.env.prepared.as_ref().and_then(|dialog| dialog.unsupported_control()) {
+                        return Err(LispError::new(format!("unsupported dialog control: {kind}")));
+                    }
+                }
                 // The value the session supplies replaces this call's.
                 self.state = State::Ret(Value::Nil);
                 self.need = Some(need);
             }
         }
+        Ok(())
     }
 }
 
 /// A variable's value (nil when unbound).
 pub fn lookup(env: &Env, s: &Sym) -> Value {
     env.globals.get(s).cloned().unwrap_or(Value::Nil)
+}
+
+pub(crate) fn restore_bindings(env: &mut Env, saved: Vec<(Sym, Option<Value>)>) {
+    restore(env, saved);
 }
 
 fn restore(env: &mut Env, saved: Vec<(Sym, Option<Value>)>) {

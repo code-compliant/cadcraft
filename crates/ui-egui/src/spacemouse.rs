@@ -119,6 +119,7 @@ fn navigate(app: &mut CadApp, params: &Value) -> Result<Value, String> {
     if !app.spacemouse.settings.enabled {
         return Ok(Value::Null);
     }
+    app.session.require_dialog_closed("ui.spacemouse.navigate").map_err(|e| e.to_string())?;
     let (width, height) = app.session.viewport_px;
     let aspect = width / height.max(1.0);
     let state = app.session.state_mut().map_err(|e| e.to_string())?;

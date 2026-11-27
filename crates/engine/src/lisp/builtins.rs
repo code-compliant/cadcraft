@@ -52,7 +52,10 @@ mod wcmatch;
 
 use args::R;
 pub use args::args_err;
-use dialogs::{load_dialog, unload_dialog};
+use dialogs::{
+    action_tile, add_list, dimx_tile, dimy_tile, done_dialog, end_image, end_list, get_tile, load_dialog, mode_tile, new_dialog, set_tile,
+    slide_image, start_dialog, start_image, start_list, term_dialog, unload_dialog,
+};
 pub use files::{LispFile, read_text_file};
 use files::{close, findfile, open, read_line, write_line};
 pub use functions::catch_all_error;
@@ -230,6 +233,22 @@ static BUILTINS: &[Builtin] = &[
     ctx!("LOAD", load),
     ctx!("LOAD_DIALOG", load_dialog),
     ctx!("UNLOAD_DIALOG", unload_dialog),
+    ctx!("NEW_DIALOG", new_dialog),
+    ctx!("GET_TILE", get_tile),
+    ctx!("SET_TILE", set_tile),
+    ctx!("START_LIST", start_list),
+    ctx!("ADD_LIST", add_list),
+    ctx!("END_LIST", end_list),
+    ctx!("ACTION_TILE", action_tile),
+    ctx!("MODE_TILE", mode_tile),
+    ctx!("DIMX_TILE", dimx_tile),
+    ctx!("DIMY_TILE", dimy_tile),
+    ctx!("START_IMAGE", start_image),
+    ctx!("SLIDE_IMAGE", slide_image),
+    ctx!("END_IMAGE", end_image),
+    ctx!("START_DIALOG", start_dialog),
+    ctx!("DONE_DIALOG", done_dialog),
+    ctx!("TERM_DIALOG", term_dialog),
     ctx!("AUTOLOAD", autoload),
     ctx!("INITGET", input::initget),
     ctx!("GETPOINT", input::getpoint),

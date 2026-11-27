@@ -17,6 +17,7 @@ impl Session {
     }
 
     pub fn zoom_extents(&mut self) -> Result<()> {
+        self.require_dialog_closed("zoom.extents")?;
         let space = self.space();
         let ext = self.doc()?.extents(&space);
         let (w, h) = self.viewport_px;
@@ -35,6 +36,7 @@ impl Session {
         if !(factor.is_finite() && factor > 0.0) {
             return Ok(());
         }
+        self.require_dialog_closed("zoom")?;
         let st = self.state_mut()?;
         let v = st.view();
         let h = (v.height / factor).clamp(1e-9, 1e12);

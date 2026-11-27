@@ -399,9 +399,36 @@ pub struct CadApp {
     pub updates_rt: updates_ui::Runtime,
 }
 
+/// Connect the slide decoder. The engine does not parse slide files itself.
+fn install_slide_decoder() {
+    cadcraft_engine::lisp::set_slide_decoder(decode_slide, cadcraft_io::slide::library_span);
+}
+
+fn decode_slide(bytes: &[u8]) -> Option<cadcraft_engine::lisp::SlideSource> {
+    use cadcraft_engine::lisp::{SlideSource, SlideSourcePrimitive, SlideSourceSolid, SlideSourceVector};
+    use cadcraft_io::slide::SlidePrim;
+
+    let slide = cadcraft_io::slide::decode(bytes)?;
+    let primitives = slide
+        .prims
+        .into_iter()
+        .map(|prim| match prim {
+            SlidePrim::Vector(line) => {
+                SlideSourcePrimitive::Vector(SlideSourceVector { x1: line.from.x, y1: line.from.y, x2: line.to.x, y2: line.to.y, color: line.color })
+            }
+            SlidePrim::Solid(solid) => SlideSourcePrimitive::Solid(SlideSourceSolid {
+                points: solid.points.into_iter().map(|point| (point.x, point.y)).collect(),
+                color: solid.color,
+            }),
+        })
+        .collect();
+    Some(SlideSource { high_x: slide.high_x, high_y: slide.high_y, primitives })
+}
+
 impl CadApp {
     /// Construct `CadApp` from a session and services with default UI state, options, canvas and command line; no control channel, capture geometry or pending shots are installed.
     pub fn new(session: Session, services: Services) -> Self {
+        install_slide_decoder();
         CadApp {
             system_languages: Vec::new(),
             system_animations: None,
@@ -1056,11 +1083,9 @@ impl CadApp {
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
-    /// Whether a modal dialog is up: the "Save changes?" prompt, the lossy-save warning or Drawing Recovery. The
-    /// floating panels' own OS windows take no input meanwhile (egui's `Modal` blocks only the
-    /// main window). The app's other dialogs are ordinary windows that leave the drawing usable.
+    /// Whether a dialog owns drawing input. Floating panels' OS windows take no input meanwhile.
     pub fn shows_modal(&self) -> bool {
-        self.close_prompt().is_some() || self.save_loss.is_some() || !self.recovery.items.is_empty()
+        self.close_prompt().is_some() || self.save_loss.is_some() || !self.recovery.items.is_empty() || self.session.dialog_active()
     }
 
     /// Input hook: refresh the raw surface snapshot, put in keys forwarded from floating panels'

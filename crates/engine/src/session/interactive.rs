@@ -49,6 +49,7 @@ impl Session {
         enabled: fn(&Session) -> std::result::Result<(), String>,
         machine: Box<dyn crate::Interactive>,
     ) -> Result<()> {
+        self.require_dialog_closed(id)?;
         self.last_polar = None;
         self.pick_hint = None;
         if self.running.is_some() {
@@ -95,8 +96,6 @@ impl Session {
 
     /// [`Session::start`] with the command's origin recorded for its whole life.
     fn start_from(&mut self, name: &str, origin: Origin) -> Result<()> {
-        self.last_polar = None;
-        self.pick_hint = None;
         let name = name.trim();
         let (transparent, name) = match name.strip_prefix('\'') {
             Some(n) => (true, n),
@@ -112,6 +111,12 @@ impl Session {
         // A command-line form with an id of its own (-ATTEDIT) is not the command it prefixes.
         let dashed = cmd::resolve_alias(&name.trim_start_matches(['_', '.']).to_ascii_lowercase());
         let id = if find_command(&dashed).is_some() { dashed } else { cmd::resolve_alias(&lower) };
+        // New from a file tab cancels the dialog before it changes the active drawing.
+        if self.dialog_active() && id != "new" {
+            return Ok(());
+        }
+        self.last_polar = None;
+        self.pick_hint = None;
         let Some(spec) = find_command(&id) else {
             // A command defined in LISP: (defun c:NAME …).
             if !transparent && let Some(f) = self.lisp_command(&lower) {
@@ -158,7 +163,12 @@ impl Session {
             // command's Program origin. Origin and number go in after it, so they describe this
             // start and the factory below still sees the origin this command was started with.
             if self.running.is_some() {
-                self.cancel();
+                if spec.id == "new" {
+                    // The handler must finish in its Lisp undo group before New switches drawings.
+                    self.cancel_for_drawing_change();
+                } else {
+                    self.cancel();
+                }
             }
             self.commands_started = self.commands_started.wrapping_add(1);
             self.command_origin = origin;
@@ -219,8 +229,16 @@ impl Session {
     /// command (as in AutoCAD) and points do nothing. A LISP routine waiting in a `get…`
     /// function takes the input instead; one paused in `command` carries on after it.
     pub fn input(&mut self, input: Input) -> Result<()> {
+        // A callback prompt takes the answer before the dialog's drawing guard.
         self.inputs = self.inputs.wrapping_add(1);
         if self.lisp_input(input.clone()) {
+            return Ok(());
+        }
+        if self.dialog_active() {
+            // Escape ends the dialog. Enter and points must not repeat a command or edit the drawing.
+            if input == Input::Cancel {
+                self.cancel();
+            }
             return Ok(());
         }
         let r = self.input_to_command(input);

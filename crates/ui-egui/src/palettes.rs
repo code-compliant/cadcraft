@@ -377,10 +377,14 @@ pub fn right_palettes(app: &mut CadApp, ui: &mut egui::Ui) {
 
 pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
+    let modal = app.session.dialog_active();
     section_header(ui, "Layers");
     // Layer tools row.
     let mut cmd = None;
     ui.horizontal(|ui| {
+        if modal {
+            ui.disable();
+        }
         ui.add_space(8.0);
         ui.spacing_mut().item_spacing = vec2(3.0, 0.0);
         for (icon, c, tip) in [
@@ -399,7 +403,7 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
             }
         }
     });
-    if let Some(c) = cmd {
+    if !modal && let Some(c) = cmd {
         if c.starts_with("ui.") {
             app.start(c);
         } else {
@@ -417,6 +421,9 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
     let mut set_current = None;
     let mut toggle: Option<(String, &str, bool)> = None;
     ui.horizontal(|ui| {
+        if modal {
+            ui.disable();
+        }
         ui.add_space(8.0);
         let w = ui.available_width() - 10.0;
         let (rect, resp) = ui.allocate_exact_size(vec2(w, 24.0), Sense::click());
@@ -492,6 +499,9 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         for (name, on, frozen, locked, color) in &layers {
             ui.horizontal(|ui| {
+                if modal {
+                    ui.disable();
+                }
                 ui.add_space(14.0);
                 if icons::button(ui, if *on { Icon::Bulb } else { Icon::BulbOff }, 18.0, "On/Off", false).clicked() {
                     toggle = Some((name.clone(), "on", !*on));
@@ -508,9 +518,14 @@ pub(crate) fn layers_section(app: &mut CadApp, ui: &mut egui::Ui) {
                 if r.clicked() {
                     set_current = Some(name.clone());
                 }
-                crate::shortcut_menus::attach(app, &r, |app| crate::shortcut_menus::layer_entries(app, name));
+                if !modal {
+                    crate::shortcut_menus::attach(app, &r, |app| crate::shortcut_menus::layer_entries(app, name));
+                }
             });
         }
+    }
+    if modal {
+        return;
     }
     if let Some(n) = set_current {
         let _ = app.run("layer.current", json!({ "name": n }));
@@ -799,6 +814,10 @@ fn shown_part(s: &str) -> String {
 
 /// Properties palette: the selection's common properties, or the current defaults when nothing is selected; formats lengths per drawing units and dispatches setter commands.
 pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
+    let modal = app.session.dialog_active();
+    if modal {
+        ui.disable();
+    }
     let t = Tokens::get();
     properties_header(app, ui);
     let sel = app.session.selection();
@@ -954,7 +973,7 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
             None => "Not available",
         };
         prop_row(ui, "Plot table type", |ui| read_only(ui, kind));
-        if let Some((c, p)) = action {
+        if !modal && let Some((c, p)) = action {
             let _ = app.run(c, p);
         }
         report_bad(app, bad);
@@ -1457,6 +1476,9 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
             }
             _ => {}
         }
+    }
+    if modal {
+        return;
     }
     if let Some(mut p) = set {
         // A rotation is typed as shown (from ANGBASE, in the ANGDIR sense); properties.set takes it

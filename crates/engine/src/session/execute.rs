@@ -24,11 +24,40 @@ impl Session {
         }
     }
 
-    /// Run a command by id, unless the automation roots, its own state or the block editor refuse it.
+    /// Run a command by id, subject to file access, dialog and command state.
     fn execute_guarded(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Some(why) = crate::file_access::commands::refusal(spec.id) {
             return Err(EngineError::Disabled(spec.id.into(), why));
+        }
+        // Modal input allows inspection and document changes that cancel the waiting routine.
+        // LISP has its own busy check. Undo metadata cannot identify commands that edit the
+        // drawing: navigation writes to an unlocked layout viewport, for example.
+        if !matches!(
+            spec.id,
+            "new"
+                | "open"
+                | "close"
+                | "closeall"
+                | "document.switch"
+                | "lisp"
+                | "drawing.inspect"
+                | "document.bytes"
+                | "entities"
+                | "texts"
+                | "view.get"
+                | "properties"
+                | "properties.describe"
+                | "getvar"
+                | "sysvars"
+                | "layout.list"
+                | "blocks.list"
+                | "style.list"
+                | "dimstyle.list"
+                | "layerstate.list"
+                | "xref"
+        ) {
+            self.require_dialog_closed(spec.id)?;
         }
         (spec.enabled)(self).map_err(|m| EngineError::Disabled(spec.id.into(), m))?;
         if let Some(why) = cmd::blocks::bedit::refused_in_editor(self, spec.id) {
